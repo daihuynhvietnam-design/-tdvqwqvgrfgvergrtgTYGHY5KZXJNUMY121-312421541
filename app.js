@@ -105,6 +105,22 @@ function escapeHtml(t) {
   return d.innerHTML;
 }
 
+// Trả về thông báo lỗi dễ hiểu, đặc biệt xử lý lỗi permission của Firestore/Auth
+function friendlyErrorMessage(err) {
+  const code = err && err.code;
+  if (code === 'permission-denied' || (err && /insufficient permissions/i.test(err.message || ''))) {
+    return 'Lỗi quyền truy cập Firestore (permission-denied). Vào Firebase Console → Firestore Database → Rules để kiểm tra và cho phép đọc/ghi collection "users".';
+  }
+  if (code === 'auth/email-already-in-use') return 'Email/SĐT đã được đăng ký!';
+  if (code === 'auth/invalid-email') return 'Email hoặc số điện thoại không hợp lệ!';
+  if (code === 'auth/weak-password') return 'Mật khẩu quá yếu, cần tối thiểu 6 ký tự!';
+  if (code === 'auth/network-request-failed') return 'Lỗi mạng, kiểm tra lại kết nối Internet!';
+  if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+    return 'Sai thông tin đăng nhập!';
+  }
+  return 'Lỗi: ' + (err && err.message ? err.message : 'Không xác định');
+}
+
 // ========== AUTH UI ==========
 const authOverlay = $('#auth-overlay');
 const authSlider = $('#auth-slider');
@@ -133,6 +149,8 @@ $$('.toggle-pass').forEach(btn => {
 });
 
 // ========== REGISTER ==========
+// FIX: toàn bộ logic (kể cả check username trùng) giờ nằm TRONG try/catch,
+// và nút submit được disable/enable ngay từ đầu để tránh double-submit / "im lặng" khi lỗi.
 $('#register-form').onsubmit = async (e) => {
   e.preventDefault();
   const name = $('#reg-name').value.trim();
@@ -145,14 +163,16 @@ $('#register-form').onsubmit = async (e) => {
   if (password.length < 6) return alert('Mật khẩu tối thiểu 6 ký tự!');
   if (!/^[a-z0-9_]{3,20}$/.test(username)) return alert('Username chỉ gồm a-z, 0-9, _ (3-20 ký tự)');
   if (!isEmail(identifier) && !isPhone(identifier)) return alert('Nhập email hoặc SĐT hợp lệ!');
-
-  const unameCheck = await db.collection('users').where('username', '==', username).limit(1).get();
-  if (!unameCheck.empty) return alert('Username đã được sử dụng!');
+  if (!$('#agree-terms').checked) return alert('Bạn cần đồng ý với Điều khoản sử dụng!');
 
   const btn = e.target.querySelector('[type="submit"]');
   btn.disabled = true; btn.textContent = 'Đang tạo...';
 
   try {
+    // Check trùng username — giờ nằm trong try/catch nên lỗi permission sẽ hiện alert rõ ràng
+    const unameCheck = await db.collection('users').where('username', '==', username).limit(1).get();
+    if (!unameCheck.empty) { alert('Username đã được sử dụng!'); return; }
+
     const email = toAuthEmail(identifier);
     const cred = await auth.createUserWithEmailAndPassword(email, password);
     const uid = cred.user.uid;
@@ -184,8 +204,7 @@ $('#register-form').onsubmit = async (e) => {
     toast('Đăng ký thành công!');
   } catch (err) {
     console.error(err);
-    if (err.code === 'auth/email-already-in-use') alert('Email/SĐT đã được đăng ký!');
-    else alert('Lỗi: ' + err.message);
+    alert(friendlyErrorMessage(err));
   } finally {
     btn.disabled = false; btn.textContent = 'Đăng ký';
   }
@@ -212,7 +231,7 @@ $('#login-form').onsubmit = async (e) => {
     toast('Đăng nhập thành công!');
   } catch (err) {
     console.error(err);
-    alert('Sai thông tin đăng nhập!');
+    alert(friendlyErrorMessage(err));
   } finally {
     btn.disabled = false; btn.textContent = 'Đăng nhập';
   }
@@ -243,7 +262,7 @@ $('#forgot-form').onsubmit = async (e) => {
     result.style.display = 'block';
     result.innerHTML = '<p>✅ Mật khẩu tạm thời:</p><div class="new-pass">' + newPass + '</div><p style="margin-top:10px;font-size:0.85rem;opacity:0.8">Đăng nhập bằng mật khẩu này. Nếu dùng email thật, kiểm tra hộp thư để reset chính thức.</p>';
   } catch (err) {
-    alert('Lỗi: ' + err.message);
+    alert(friendlyErrorMessage(err));
   } finally {
     btn.disabled = false; btn.textContent = 'Lấy lại mật khẩu';
   }
@@ -256,22 +275,28 @@ auth.onAuthStateChanged(async (user) => {
 
   if (user) {
     currentUser = user;
-    const doc = await db.collection('users').doc(user.uid).get();
-    if (doc.exists) {
-      currentUserData = { id: doc.id, ...doc.data() };
-    } else {
-      currentUserData = {
-        id: user.uid, uid: user.uid,
-        name: user.displayName || 'Người dùng SREC',
-        username: 'user' + user.uid.slice(0, 6),
-        identifier: user.email, bio: '', avatar: '', cover: '',
-        friends: [], verification: 'none',
-        privacy: { story: 'public', note: 'public', post: 'public' },
-        language: 'vi'
-      };
-      await db.collection('users').doc(user.uid).set(currentUserData, { merge: true });
+    try {
+      const doc = await db.collection('users').doc(user.uid).get();
+      if (doc.exists) {
+        currentUserData = { id: doc.id, ...doc.data() };
+      } else {
+        currentUserData = {
+          id: user.uid, uid: user.uid,
+          name: user.displayName || 'Người dùng SREC',
+          username: 'user' + user.uid.slice(0, 6),
+          identifier: user.email, bio: '', avatar: '', cover: '',
+          friends: [], verification: 'none',
+          privacy: { story: 'public', note: 'public', post: 'public' },
+          language: 'vi'
+        };
+        await db.collection('users').doc(user.uid).set(currentUserData, { merge: true });
+      }
+      showApp();
+    } catch (err) {
+      console.error(err);
+      alert(friendlyErrorMessage(err));
+      showLanding();
     }
-    showApp();
   } else {
     currentUser = null;
     currentUserData = null;
@@ -704,7 +729,7 @@ $('#btn-submit-post').onclick = async () => {
     });
     $('#create-post-modal').classList.remove('active');
     toast('Đã đăng bài!');
-  } catch (err) { alert('Lỗi: ' + err.message); }
+  } catch (err) { alert(friendlyErrorMessage(err)); }
   finally { btn.disabled = false; btn.textContent = 'Đăng'; }
 };
 
@@ -778,7 +803,7 @@ $('#btn-submit-story').onclick = async () => {
     $('#story-modal').classList.remove('active');
     loadStories();
     toast('Đã đăng Story!');
-  } catch (err) { alert('Lỗi: ' + err.message); }
+  } catch (err) { alert(friendlyErrorMessage(err)); }
   finally { btn.disabled = false; btn.textContent = 'Đăng Story'; }
 };
 
@@ -797,7 +822,7 @@ $('#btn-submit-note').onclick = async () => {
     });
     $('#note-modal').classList.remove('active');
     toast('Đã đăng ghi chú!');
-  } catch (err) { alert('Lỗi: ' + err.message); }
+  } catch (err) { alert(friendlyErrorMessage(err)); }
 };
 
 // ========== PROFILE ==========
@@ -1014,7 +1039,7 @@ $('#avatar-input').onchange = async (e) => {
     toast('Đã đổi avatar!');
   } catch (err) {
     console.error(err);
-    alert('Lỗi đổi avatar: ' + err.message + '\n\nKiểm tra Firebase Storage rules cho phép write.');
+    alert(friendlyErrorMessage(err) + '\n\nKiểm tra Firebase Storage rules cho phép write.');
   }
   e.target.value = '';
 };
@@ -1044,7 +1069,7 @@ $('#cover-input').onchange = async (e) => {
     toast('Đã đổi ảnh bìa!');
   } catch (err) {
     console.error(err);
-    alert('Lỗi đổi ảnh bìa: ' + err.message + '\n\nKiểm tra Firebase Storage rules.');
+    alert(friendlyErrorMessage(err) + '\n\nKiểm tra Firebase Storage rules.');
   }
   e.target.value = '';
 };
@@ -1200,7 +1225,7 @@ function loadMessages() {
           try {
             await db.collection('chats').doc(activeChatId).collection('messages').doc(btn.dataset.mid).delete();
             toast('Đã xóa tin nhắn');
-          } catch (err) { alert('Lỗi xóa: ' + err.message); }
+          } catch (err) { alert(friendlyErrorMessage(err)); }
         };
       });
     });
@@ -1273,7 +1298,7 @@ async function sendMessage() {
       lastMessage: text, updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
     updateStreak();
-  } catch (err) { alert('Lỗi gửi tin'); }
+  } catch (err) { alert(friendlyErrorMessage(err)); }
 }
 
 // Chat background
@@ -1328,10 +1353,6 @@ function endVideoCall() {
   $('#video-call-modal')?.classList.remove('active');
 }
 
-// Search result also open profile on name click - enhance already done
-// Make search open profile option: long-term click opens profile
-
-
 // ========== SETTINGS ==========
 function loadSettings() {
   $('#set-name').value = currentUserData.name || '';
@@ -1366,16 +1387,20 @@ $('#btn-save-general').onclick = async () => {
   if (!name) return alert('Tên không được trống');
   if (!/^[a-z0-9_]{3,20}$/.test(username)) return alert('Username không hợp lệ');
 
-  if (username !== currentUserData.username) {
-    const check = await db.collection('users').where('username', '==', username).limit(1).get();
-    if (!check.empty && check.docs[0].id !== currentUser.uid) return alert('Username đã được dùng!');
-  }
+  try {
+    if (username !== currentUserData.username) {
+      const check = await db.collection('users').where('username', '==', username).limit(1).get();
+      if (!check.empty && check.docs[0].id !== currentUser.uid) { alert('Username đã được dùng!'); return; }
+    }
 
-  await db.collection('users').doc(currentUser.uid).update({ name, username, bio });
-  currentUserData.name = name; currentUserData.username = username; currentUserData.bio = bio;
-  await auth.currentUser.updateProfile({ displayName: name });
-  updateUserUI();
-  toast('Đã lưu!');
+    await db.collection('users').doc(currentUser.uid).update({ name, username, bio });
+    currentUserData.name = name; currentUserData.username = username; currentUserData.bio = bio;
+    await auth.currentUser.updateProfile({ displayName: name });
+    updateUserUI();
+    toast('Đã lưu!');
+  } catch (err) {
+    alert(friendlyErrorMessage(err));
+  }
 };
 
 $('#set-change-avatar').onclick = () => $('#avatar-input').click();
@@ -1386,46 +1411,56 @@ $('#btn-save-privacy').onclick = async () => {
     note: $('#set-note-privacy').value,
     post: $('#set-post-privacy').value
   };
-  await db.collection('users').doc(currentUser.uid).update({ privacy });
-  currentUserData.privacy = privacy;
-  toast('Đã lưu quyền riêng tư!');
+  try {
+    await db.collection('users').doc(currentUser.uid).update({ privacy });
+    currentUserData.privacy = privacy;
+    toast('Đã lưu quyền riêng tư!');
+  } catch (err) { alert(friendlyErrorMessage(err)); }
 };
 
 $('#btn-save-lang').onclick = async () => {
   const language = $('#set-language').value;
-  await db.collection('users').doc(currentUser.uid).update({ language });
-  currentUserData.language = language;
-  toast(language === 'vi' ? 'Đã chuyển sang Tiếng Việt' : 'Switched to English');
+  try {
+    await db.collection('users').doc(currentUser.uid).update({ language });
+    currentUserData.language = language;
+    toast(language === 'vi' ? 'Đã chuyển sang Tiếng Việt' : 'Switched to English');
+  } catch (err) { alert(friendlyErrorMessage(err)); }
 };
 
 $('#btn-request-verify').onclick = async () => {
   const type = $('#verify-type').value;
   const reason = $('#verify-reason').value.trim();
   if (!reason) return alert('Hãy ghi lý do!');
-  const pending = await db.collection('verificationRequests').where('userId', '==', currentUser.uid).where('status', '==', 'pending').limit(1).get();
-  if (!pending.empty) return alert('Bạn đang có yêu cầu chờ duyệt!');
+  try {
+    const pending = await db.collection('verificationRequests').where('userId', '==', currentUser.uid).where('status', '==', 'pending').limit(1).get();
+    if (!pending.empty) { alert('Bạn đang có yêu cầu chờ duyệt!'); return; }
 
-  await db.collection('verificationRequests').add({
-    userId: currentUser.uid, userName: currentUserData.name, type, reason,
-    status: 'pending', createdAt: firebase.firestore.FieldValue.serverTimestamp()
-  });
-  toast('Đã gửi yêu cầu xác minh! Admin sẽ duyệt.');
-  $('#verify-reason').value = '';
-  loadVerifyHistory();
+    await db.collection('verificationRequests').add({
+      userId: currentUser.uid, userName: currentUserData.name, type, reason,
+      status: 'pending', createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    toast('Đã gửi yêu cầu xác minh! Admin sẽ duyệt.');
+    $('#verify-reason').value = '';
+    loadVerifyHistory();
+  } catch (err) { alert(friendlyErrorMessage(err)); }
 };
 
 async function loadVerifyHistory() {
   const box = $('#verify-history');
-  const snap = await db.collection('verificationRequests').where('userId', '==', currentUser.uid).limit(5).get();
-  if (snap.empty) { box.innerHTML = ''; return; }
-  let html = '<h4 style="margin-bottom:8px;">Lịch sử yêu cầu</h4>';
-  const statusMap = { pending: '⏳ Chờ duyệt', approved: '✅ Đã duyệt', rejected: '❌ Từ chối' };
-  snap.forEach(doc => {
-    const r = doc.data();
-    html += '<div class="term-block" style="margin-bottom:8px;"><p><strong>' + r.type + '</strong> — ' + (statusMap[r.status] || r.status) + '</p>' +
-      '<p style="font-size:0.85rem;color:var(--text-muted);">' + escapeHtml(r.reason) + '</p></div>';
-  });
-  box.innerHTML = html;
+  try {
+    const snap = await db.collection('verificationRequests').where('userId', '==', currentUser.uid).limit(5).get();
+    if (snap.empty) { box.innerHTML = ''; return; }
+    let html = '<h4 style="margin-bottom:8px;">Lịch sử yêu cầu</h4>';
+    const statusMap = { pending: '⏳ Chờ duyệt', approved: '✅ Đã duyệt', rejected: '❌ Từ chối' };
+    snap.forEach(doc => {
+      const r = doc.data();
+      html += '<div class="term-block" style="margin-bottom:8px;"><p><strong>' + r.type + '</strong> — ' + (statusMap[r.status] || r.status) + '</p>' +
+        '<p style="font-size:0.85rem;color:var(--text-muted);">' + escapeHtml(r.reason) + '</p></div>';
+    });
+    box.innerHTML = html;
+  } catch (err) {
+    box.innerHTML = '<p style="color:var(--danger)">' + friendlyErrorMessage(err) + '</p>';
+  }
 }
 
 $('#btn-create-page').onclick = async () => {
@@ -1433,31 +1468,35 @@ $('#btn-create-page').onclick = async () => {
   const type = $('#page-type').value;
   const desc = $('#page-desc').value.trim();
   if (!name) return alert('Nhập tên trang!');
-  await db.collection('pages').add({
-    name, type, description: desc, ownerId: currentUser.uid, ownerName: currentUserData.name,
-    followers: [], createdAt: firebase.firestore.FieldValue.serverTimestamp()
-  });
-  toast('Đã tạo trang!');
-  $('#page-name').value = ''; $('#page-desc').value = '';
-  loadMyPages();
+  try {
+    await db.collection('pages').add({
+      name, type, description: desc, ownerId: currentUser.uid, ownerName: currentUserData.name,
+      followers: [], createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    toast('Đã tạo trang!');
+    $('#page-name').value = ''; $('#page-desc').value = '';
+    loadMyPages();
+  } catch (err) { alert(friendlyErrorMessage(err)); }
 };
 
 async function loadMyPages() {
   const box = $('#my-pages');
-  const snap = await db.collection('pages').where('ownerId', '==', currentUser.uid).get();
-  if (snap.empty) { box.innerHTML = '<p style="color:var(--text-muted);font-size:0.9rem;">Bạn chưa có trang nào</p>'; return; }
-  let html = '<h4 style="margin-bottom:12px;">Trang của bạn</h4>';
-  const typeLabel = { personal: 'Cá nhân', business: 'Kinh doanh', community: 'Cộng đồng', brand: 'Thương hiệu' };
-  snap.forEach(doc => {
-    const p = doc.data();
-    html += '<div class="term-block" style="margin-bottom:8px;"><strong>' + escapeHtml(p.name) + '</strong>' +
-      '<span style="color:var(--text-muted);font-size:0.85rem;"> — ' + (typeLabel[p.type] || p.type) + '</span>' +
-      '<p style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;">' + escapeHtml(p.description || '') + '</p></div>';
-  });
-  box.innerHTML = html;
+  try {
+    const snap = await db.collection('pages').where('ownerId', '==', currentUser.uid).get();
+    if (snap.empty) { box.innerHTML = '<p style="color:var(--text-muted);font-size:0.9rem;">Bạn chưa có trang nào</p>'; return; }
+    let html = '<h4 style="margin-bottom:12px;">Trang của bạn</h4>';
+    const typeLabel = { personal: 'Cá nhân', business: 'Kinh doanh', community: 'Cộng đồng', brand: 'Thương hiệu' };
+    snap.forEach(doc => {
+      const p = doc.data();
+      html += '<div class="term-block" style="margin-bottom:8px;"><strong>' + escapeHtml(p.name) + '</strong>' +
+        '<span style="color:var(--text-muted);font-size:0.85rem;"> — ' + (typeLabel[p.type] || p.type) + '</span>' +
+        '<p style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;">' + escapeHtml(p.description || '') + '</p></div>';
+    });
+    box.innerHTML = html;
+  } catch (err) {
+    box.innerHTML = '<p style="color:var(--danger)">' + friendlyErrorMessage(err) + '</p>';
+  }
 }
-
-
 
 // ========== ADMIN PANEL ==========
 function isAdminUser() {
@@ -1560,7 +1599,7 @@ async function loadAdminVerifyPending() {
           toast('Đã duyệt tick!');
           loadAdmin();
         } catch (err) {
-          alert('Lỗi: ' + err.message);
+          alert(friendlyErrorMessage(err));
           btn.disabled = false;
         }
       };
@@ -1591,14 +1630,14 @@ async function loadAdminVerifyPending() {
           toast('Đã từ chối');
           loadAdmin();
         } catch (err) {
-          alert('Lỗi: ' + err.message);
+          alert(friendlyErrorMessage(err));
           btn.disabled = false;
         }
       };
     });
   } catch (err) {
     console.error(err);
-    box.innerHTML = '<p style="color:var(--danger)">Lỗi tải dữ liệu</p>';
+    box.innerHTML = '<p style="color:var(--danger)">' + friendlyErrorMessage(err) + '</p>';
   }
 }
 
@@ -1714,7 +1753,7 @@ async function loadAdminUsers(filter = '') {
     });
   } catch (err) {
     console.error(err);
-    box.innerHTML = '<p style="color:var(--danger)">Lỗi tải users</p>';
+    box.innerHTML = '<p style="color:var(--danger)">' + friendlyErrorMessage(err) + '</p>';
   }
 }
 
@@ -1782,15 +1821,4 @@ async function loadAdminPosts() {
   }
 }
 
-// Chặn user bị ban khi đăng nhập
-const _origOnAuth = auth.onAuthStateChanged;
-// Check ban after profile load is already in onAuthStateChanged - add check in showApp path
-async function checkBannedAndKick() {
-  if (currentUserData && currentUserData.banned === true) {
-    alert('Tài khoản của bạn đã bị khóa bởi Quản trị viên.');
-    await auth.signOut();
-  }
-}
-
-
-console.log('SREC App v2 + Admin loaded ✓');
+console.log('SREC App v2 + Admin (fixed register/login error handling) loaded ✓');
